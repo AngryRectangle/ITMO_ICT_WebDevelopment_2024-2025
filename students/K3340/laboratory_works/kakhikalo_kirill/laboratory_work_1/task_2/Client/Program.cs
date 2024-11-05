@@ -23,46 +23,21 @@ class Program
             return;
         }
 
-        var dataToSend = BitConverter.GetBytes(a).Concat(BitConverter.GetBytes(b)).ToArray();
-        var sentBytes = 0;
-        var receivedBytes = new byte[1024];
-        var receivedBytesCount = 0;
+        var url = $"http://127.0.0.1:22102/math?a={a}&b={b}";
 
-        while (true)
+        using var client = new HttpClient();
+        try
         {
-            try
-            {
-                // Пока нет никакого ответа от сервера шлём сообщения снова
-                if (receivedBytesCount == 0)
-                {
-                    sentBytes += await socket.SendToAsync(dataToSend.AsMemory(sentBytes, dataToSend.Length - sentBytes), targetEndPoint);
-                    if (sentBytes == dataToSend.Length)
-                        sentBytes = 0;
-                }
-
-                try
-                {
-                    var newlyReceived = await socket.ReceiveAsync(receivedBytes);
-                    Console.WriteLine("Received from server:");
-                    Console.Write(BitConverter.ToSingle(receivedBytes, 0));
-                    receivedBytesCount += newlyReceived;
-                }
-                catch (SocketException e)
-                {
-                    if (e.SocketErrorCode == SocketError.TimedOut)
-                    {
-                        Console.WriteLine("Server is not responding, trying to send message again.");
-                    }
-                    else
-                    {
-                        Console.WriteLine(e);
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Console.WriteLine(e);
-            }
+            var response = await client.GetAsync(url);
+            var resultString = await response.Content.ReadAsStringAsync();
+            if (float.TryParse(resultString, out float c))
+                Console.WriteLine($"The value of c is: {c}");
+            else
+                Console.WriteLine("Failed to parse the response as a float.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"An error occurred: {ex.Message}.");
         }
     }
 }

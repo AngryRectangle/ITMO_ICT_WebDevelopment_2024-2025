@@ -1,4 +1,56 @@
-﻿using System.Net;
+# Задание 2
+
+Реализовать клиентскую и серверную часть приложения. Клиент запрашивает выполнение математической операции, параметры
+которой вводятся с клавиатуры. Сервер обрабатывает данные и возвращает результат клиенту.
+
+Варианты операций:
+
+- Теорема Пифагора.
+- Решение квадратного уравнения.
+- Поиск площади трапеции.
+- Поиск площади параллелограмма.
+
+Порядок выбора варианта: Выбирается по порядковому номеру в журнале (пятый студент получает вариант 1 и т.д.).
+
+# Требования
+
+- Обязательно использовать библиотеку socket.
+- Реализовать с помощью протокола TCP.
+
+# Ход работы
+
+Мой номер 21, мой вариант 1. Теорема Пифагора.
+В начале всё реализовал как в первом задании, но только потом понял,
+что нужно сделать не на UDP, а на TCP. Самым простым оказалось использовать ядро,
+которое написано поверх TCP для заданий 3,4,5. Поэтому я решил использовать его и для этого задания.
+Описание ядра есть в следующем задании.
+Вот код сервера который относится конкретно к этому заданию:
+
+```csharp
+webServer.RegisterRouteGet("/math",
+    async arguments =>
+    {
+        if (!arguments.TryGetValue("a", out var aRaw) || !int.TryParse(aRaw, out var a))
+            return new HttpResponse("", HttpResponse.Type.BadRequest);
+        
+        if (!arguments.TryGetValue("b", out var bRaw) || !int.TryParse(bRaw, out var b))
+            return new HttpResponse("", HttpResponse.Type.BadRequest);
+        
+        var cValue = (float)Math.Sqrt(a * a + b * b);
+        return new HttpResponse(cValue.ToString(), HttpResponse.Type.Success);
+    });
+```
+
+Клиент просто отправляет HTTP запросы к серверу, на которые он отвечает,
+как на обычные HTTP запросы. Но всё это написано поверх голого сокета, что соответствует питоновскому socket
+и с помощью протокола TCP.
+
+# Листинг кода
+
+#### Сервер
+
+```csharp
+using System.Net;
 using System.Net.Sockets;
 using System.Text;
 
@@ -298,3 +350,52 @@ class Program
         }
     }
 }
+```
+
+#### Клиент
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace Client;
+
+class Program
+{
+    public static async Task Main(string[] args)
+    {
+        var targetPort = 22102;
+        var targetAddress = IPAddress.Parse("127.0.0.1");
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        var targetEndPoint = new IPEndPoint(targetAddress, targetPort);
+
+        var a = 0;
+        var b = 0;
+        Console.WriteLine("Write a and b of equation a^2 + b^2 = c^2 to get c:");
+        var aB = Console.ReadLine().Split(' ');
+        if (aB.Length != 2 || !int.TryParse(aB[0], out a) || !int.TryParse(aB[1], out b))
+        {
+            Console.WriteLine("Invalid input, exiting.");
+            return;
+        }
+
+        var url = $"http://127.0.0.1:22102/math?a={a}&b={b}";
+
+        using var client = new HttpClient();
+        try
+        {
+            var response = await client.GetAsync(url);
+            var resultString = await response.Content.ReadAsStringAsync();
+            if (float.TryParse(resultString, out float c))
+                Console.WriteLine($"The value of c is: {c}");
+            else
+                Console.WriteLine("Failed to parse the response as a float.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"An error occurred: {ex.Message}.");
+        }
+    }
+}
+```
