@@ -10,50 +10,28 @@
 
 # Ход работы
 
-Клиент здесь не нужен, так как в его роли выступает всё, что может отправлять HTTP-запросы, к примеру, Postman.
-Здесь я сделал небольшое мини-ядро для http сервера, на котором я по итогу реализовал 3, 4 и 5 задания.
+В начале реализовал чат на http ядре которое делал для других тасок, но пришлось переделать на отдельное
+решение поверх tcp сокетов. Сервер принимает подключения, слушает сокеты и отправляет через них сообщения
+в отдельном треде сервера, а "бизнес логика" по получению сообщений и выбиранию кому их отправить находиться в основном
+треде.
 
-Реализовано получение аргументов из url и только оттуда, обращения к разным эндпоинтам по разным методам
-(только Get и Post), а также отправка валидного ответа с корректными статус кодами.
-
-Кроме кода ядра для выполнения этого задания понадобилось только:
-
-```csharp
-var messages = new List<Message>();
-webServer.RegisterRoutePost("/message", async arguments =>
-{
-    if (!arguments.TryGetValue("text", out var text) || string.IsNullOrWhiteSpace(text))
-        return new HttpResponse("", HttpResponse.Type.BadRequest);
-
-    if (!arguments.TryGetValue("author", out var author) || string.IsNullOrWhiteSpace(author))
-        return new HttpResponse("", HttpResponse.Type.BadRequest);
-
-    messages.Add(new(author, text, DateTime.Now));
-    return new HttpResponse("", HttpResponse.Type.Success);
-});
-
-webServer.RegisterRouteGet("/messages", async arguments =>
-{
-    if (!arguments.TryGetValue("lastSeen", out var lastSeenString) ||
-        !DateTime.TryParse(lastSeenString, out var lastSeen))
-        lastSeen = DateTime.MinValue;
-    
-    var newMessages = messages.Where(m => m.At > lastSeen).ToList();
-    return new HttpResponse(JsonSerializer.Serialize(newMessages), HttpResponse.Type.Success);
-});
-```
-
-Чат многопользовательский, когда кому-то нужно получить самые новые сообщения он делает запрос на
-/messages?lastSeen=DateTime,
-когда нужно отправить сообщение, делает запрос на /message?author=Author&text=Text.
+На клиенте самой сложной задачей оказалось сделать не то, что требовалось напрямую по заданию,
+а так чтобы сообщения от других пользователей не мешали вводу сообщений от текущего пользователя,
+из-за того что при отправке сообщений ввод пользователя разбивался на несколько строк пришлось писать
+страшные конструкции для очистки консоли, сохранения ввода пользователя по буквам и тд.
 
 # Листинг кода
 
+## Сервер
+
 ```csharp
+using System.Collections.Concurrent;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
-using System.Text.Json;
+using System.Text.Unicode;
 
 namespace Server;
 
@@ -67,71 +45,51 @@ class Program
         socket.Listen(10);
 
         var webServer = new WebServer(socket);
-
-        var messages = new List<Message>();
-        webServer.RegisterRoutePost("/message", async arguments =>
-        {
-            if (!arguments.TryGetValue("text", out var text) || string.IsNullOrWhiteSpace(text))
-                return new HttpResponse("", HttpResponse.Type.BadRequest);
-
-            if (!arguments.TryGetValue("author", out var author) || string.IsNullOrWhiteSpace(author))
-                return new HttpResponse("", HttpResponse.Type.BadRequest);
-
-            messages.Add(new(author, text, DateTime.Now));
-            return new HttpResponse("", HttpResponse.Type.Success);
-        });
-
-        webServer.RegisterRouteGet("/messages", async arguments =>
-        {
-            if (!arguments.TryGetValue("lastSeen", out var lastSeenString) ||
-                !DateTime.TryParse(lastSeenString, out var lastSeen))
-                lastSeen = DateTime.MinValue;
-
-            var newMessages = messages.Where(m => m.At > lastSeen).ToList();
-            return new HttpResponse(JsonSerializer.Serialize(newMessages), HttpResponse.Type.Success);
-        });
+        var packets = new List<WebServer.ReceivedPacket>();
 
         while (true)
         {
-            webServer.PollConnection();
-            webServer.PollRequests();
-            webServer.PollRequestProcessing();
-        }
-    }
+            webServer.FlushPackets(packets);
+            foreach (var packet in packets)
+            {
+                var sender = packet.Sender;
+                var message = UTF32Encoding.UTF32.GetString(packet.Value);
+                var fullMessageText = $"{sender.Address}:{sender.Port} : {message}";
+                Console.WriteLine(fullMessageText);
 
-    public class Message
-    {
-        public string Author { get; set; }
-        public string Text { get; set; }
-        public DateTime At { get; set; }
+                var dataToSend = UTF32Encoding.UTF32.GetBytes(fullMessageText);
+                webServer.SendPacket(ip => !Equals(ip, sender), dataToSend);
+            }
 
-        public Message(string author, string text, DateTime at)
-        {
-            Author = author;
-            Text = text;
-            At = at;
+            packets.Clear();
         }
     }
 
     private class WebServer
     {
         private readonly Socket _socket;
-        private readonly Dictionary<EndPoint, Connection> _connections = new();
-
-        private readonly Dictionary<string, Func<Dictionary<string, string>, Task<HttpResponse>>>
-            _routeHandlersGet = new();
-
-        private readonly Dictionary<string, Func<Dictionary<string, string>, Task<HttpResponse>>>
-            _routeHandlersPost = new();
+        private readonly ConcurrentDictionary<EndPoint, Connection> _connections = new();
+        private readonly ConcurrentQueue<ReceivedPacket> _packets = new();
 
         private bool _isWaitingForConnection;
 
         public WebServer(Socket socket)
         {
             _socket = socket;
+            var thread = new Thread(() =>
+            {
+                while (true)
+                {
+                    PollConnections();
+                    PoolSend();
+                    PoolReceive();
+                }
+            });
+
+            thread.Start();
         }
 
-        public void PollConnection()
+        private void PollConnections()
         {
             if (_isWaitingForConnection)
                 return;
@@ -144,90 +102,26 @@ class Program
                 OnAccept(null, socketAsyncEventArgs);
         }
 
-        public void PollRequests()
+        private void PoolSend()
         {
-            foreach (var connection in _connections.ToArray())
+            foreach (var connection in _connections.Values)
             {
-                var receivingTask = connection.Value.ReceivingTask;
-                if (receivingTask is null)
-                {
-                    receivingTask = connection.Value.Client.ReceiveAsync(connection.Value.Buffer);
-                    connection.Value.ReceivingTask = receivingTask;
-                    continue;
-                }
-
-                if (!receivingTask.IsCompleted)
-                    continue;
-
-                connection.Value.ReceivingTask = null;
-
                 try
                 {
-                    try
-                    {
-                        var receivedBytesCount = receivingTask.Result;
-                        connection.Value.FlushToStream(receivedBytesCount);
-                    }
-                    catch (AggregateException e)
-                    {
-                        throw e.InnerException!;
-                    }
+                    if (connection.IsSending)
+                        connection.PollWrite();
                 }
                 catch (SocketException e)
                 {
-                    if (e.SocketErrorCode != SocketError.ConnectionReset)
-                        Console.WriteLine(e);
-                    connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
+                    if (e.SocketErrorCode == SocketError.ConnectionReset)
+                        RemoveDisconnectedClient(connection);
+                    else
+                        throw;
                 }
-                catch (Exception e)
-                {
-                    Console.WriteLine(e);
-                    connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
-                }
+
+                if (!connection.Client.Connected)
+                    RemoveDisconnectedClient(connection);
             }
-        }
-
-        public void PollRequestProcessing()
-        {
-            foreach (var connection in _connections.ToArray())
-            {
-                var requestProcessingTask = connection.Value.RequestProcessingTask;
-                if (requestProcessingTask is null)
-                {
-                    connection.Value.RequestProcessingTask = ProcessRequest(connection.Value.RequestReader);
-                    continue;
-                }
-
-                if (!requestProcessingTask.IsCompleted)
-                    continue;
-
-                connection.Value.RequestProcessingTask = null;
-                connection.Value.ResetBuffer();
-
-                try
-                {
-                    var response = requestProcessingTask.Result;
-                    connection.Value.Client.Send(response);
-                }
-                catch (Exception e)
-                {
-                    Console.WriteLine(e);
-                    connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
-                }
-            }
-        }
-
-        public void RegisterRouteGet(string route, Func<Dictionary<string, string>, Task<HttpResponse>> handler)
-        {
-            _routeHandlersGet.Add(route, handler);
-        }
-
-        public void RegisterRoutePost(string route, Func<Dictionary<string, string>, Task<HttpResponse>> handler)
-        {
-            _routeHandlersPost.Add(route, handler);
         }
 
         private void OnAccept(object? sender, SocketAsyncEventArgs e)
@@ -245,91 +139,180 @@ class Program
             }
 
             var connection = new Connection(e.AcceptSocket);
-            _connections.Add(connection.Client.RemoteEndPoint, connection);
+            connection.Client.ReceiveTimeout = 1;
+            connection.Client.SendTimeout = 1;
+            _connections.TryAdd(connection.Client.RemoteEndPoint, connection);
             _isWaitingForConnection = false;
         }
 
-        private async Task<byte[]> ProcessRequest(StreamReader connectionRequestReader)
+        public void FlushPackets(List<ReceivedPacket> packets)
         {
-            var firstLine = await connectionRequestReader.ReadLineAsync();
-            if (firstLine == null)
-                return Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+            while (_packets.TryDequeue(out var packet))
+                packets.Add(packet);
+        }
 
-            var requestParts = firstLine.Split(' ');
-            if (requestParts.Length != 3 || (requestParts[0] != "GET" && requestParts[0] != "POST"))
-                return Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
-
-            var pathAndArguments = requestParts[1].Split('?');
-            var path = pathAndArguments[0];
-            var headers = new List<string>();
-            var maxHeadersCount = 100;
-            while (maxHeadersCount-- > 0)
+        private void PoolReceive()
+        {
+            foreach (var connection in _connections.Values)
             {
-                var header = await connectionRequestReader.ReadLineAsync();
-                if (string.IsNullOrEmpty(header))
-                    break;
-
-                headers.Add(header);
+                try
+                {
+                    while (connection.PollRead(out var result))
+                        _packets.Enqueue(new ReceivedPacket(connection.Client.RemoteEndPoint as IPEndPoint, result));
+                }
+                catch (SocketException e)
+                {
+                    if (e.SocketErrorCode == SocketError.ConnectionReset)
+                        RemoveDisconnectedClient(connection);
+                    else
+                        throw;
+                }
             }
+        }
 
-            if (maxHeadersCount == 0)
-                return Encoding.ASCII.GetBytes("HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n");
+        private void RemoveDisconnectedClient(Connection connection)
+        {
+            Console.WriteLine($"Client {connection.Client.RemoteEndPoint} disconnected");
+            _connections.TryRemove(connection.Client.RemoteEndPoint, out _);
+        }
 
-            Func<Dictionary<string, string>, Task<HttpResponse>> handler = null;
-            if (requestParts[0] == "GET" && !_routeHandlersGet.TryGetValue(path, out handler))
-                return Encoding.ASCII.GetBytes("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-
-            if (requestParts[0] == "POST" && !_routeHandlersPost.TryGetValue(path, out handler))
-                return Encoding.ASCII.GetBytes("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-
-            var argumentsRaw = pathAndArguments.Length > 1 ? pathAndArguments[1] : "";
-            var arguments = argumentsRaw.Split('&')
-                .Where(e => !string.IsNullOrWhiteSpace(e)).Select(x => x.Split('='))
-                .ToDictionary(x => x[0], x => x[1]);
-            try
+        public void SendPacket(Predicate<IPEndPoint> receiverFilter, Span<byte> data)
+        {
+            foreach (var connection in _connections.Values)
             {
-                Console.WriteLine($"Processing request: {path} with method {requestParts[0]}");
-                var response = await handler(arguments);
-                return Encoding.ASCII.GetBytes(
-                    $"HTTP/1.1 {response.GetStatusString()}\r\nContent-Length: {response.Content.Length}\r\n\r\n{response.Content}");
+                try
+                {
+                    if (receiverFilter(connection.Client.RemoteEndPoint as IPEndPoint))
+                        connection.Send(data);
+                }
+                catch (SocketException e)
+                {
+                    if (e.SocketErrorCode == SocketError.ConnectionReset)
+                        RemoveDisconnectedClient(connection);
+                    else
+                        throw;
+                }
             }
-            catch (Exception e)
+        }
+
+        public class ReceivedPacket
+        {
+            public IPEndPoint Sender;
+            public byte[] Value;
+
+            public ReceivedPacket(IPEndPoint sender, byte[] value)
             {
-                Console.WriteLine(e);
-                return Encoding.ASCII.GetBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
+                Sender = sender;
+                Value = value;
             }
         }
     }
 
     private class Connection : IDisposable
     {
-        public readonly Socket Client;
-        public readonly byte[] Buffer = new byte[1024 * 8];
-        public readonly StreamReader RequestReader;
-        public Task<int> ReceivingTask;
-        public Task<byte[]> RequestProcessingTask;
+        private const int PacketHeaderSize = 2;
 
-        public int ReceivedBytesCount { get; private set; }
-        private readonly ProducerConsumerStream _receivedStream;
+        public readonly Socket Client;
+        public readonly byte[] ReceiveBuffer = new byte[1024 * 8];
+        public readonly byte[] SendBuffer = new byte[1024 * 8];
+
+        public bool IsSending => _sentBytes < _bytesToSent;
+
+        private int _sentBytes;
+        private int _bytesToSent;
+        private int _bytesReceived;
+        private int _bytesToReceive;
 
         public Connection(Socket client)
         {
             Client = client;
-            _receivedStream = new ProducerConsumerStream();
-            RequestReader = new StreamReader(_receivedStream, Encoding.ASCII);
         }
 
-        public void FlushToStream(int count)
+        public void Send(Span<byte> data)
         {
-            ReceivedBytesCount += count;
-            _receivedStream.Write(Buffer, 0, count);
-            _receivedStream.Flush();
+            while (PollWrite())
+                Thread.Sleep(1);
+
+            var size = (ushort)data.Length;
+            SendBuffer[0] = (byte)(size & 0xFF);
+            SendBuffer[1] = (byte)((size >> 8) & 0xFF);
+
+            var sizeWithHeader = data.Length + PacketHeaderSize;
+            if (sizeWithHeader > SendBuffer.Length)
+                throw new InvalidOperationException("Data is too big");
+
+            data.CopyTo(SendBuffer.AsSpan(PacketHeaderSize));
+            _bytesToSent = sizeWithHeader;
+            _sentBytes = 0;
         }
 
-        public void ResetBuffer()
+        public bool PollWrite()
         {
-            Array.Clear(Buffer, 0, Buffer.Length);
-            _receivedStream.Flush();
+            if (_sentBytes >= _bytesToSent)
+                return false;
+
+            try
+            {
+                var sentBytes = Client.Send(SendBuffer, _sentBytes, _bytesToSent - _sentBytes, SocketFlags.None);
+                _sentBytes += sentBytes;
+                return true;
+            }
+            catch (SocketException e)
+            {
+                if (e.SocketErrorCode != SocketError.TimedOut)
+                    throw;
+
+                return false;
+            }
+        }
+
+        public bool PollRead([MaybeNullWhen(false)] out byte[] result)
+        {
+            result = null;
+
+            if (_bytesReceived < PacketHeaderSize)
+            {
+                try
+                {
+                    _bytesReceived += Client.Receive(ReceiveBuffer, 0, PacketHeaderSize - _bytesReceived,
+                        SocketFlags.None);
+                }
+                catch (SocketException e)
+                {
+                    if (e.SocketErrorCode != SocketError.TimedOut)
+                        throw;
+
+                    return false;
+                }
+
+                if (_bytesReceived < PacketHeaderSize)
+                    return false;
+
+                var packetSize = ReceiveBuffer[0] | (ReceiveBuffer[1] << 8);
+                _bytesToReceive = packetSize + PacketHeaderSize;
+            }
+
+            try
+            {
+                _bytesReceived += Client.Receive(ReceiveBuffer, _bytesReceived, _bytesToReceive - _bytesReceived,
+                    SocketFlags.None);
+            }
+            catch (SocketException e)
+            {
+                if (e.SocketErrorCode != SocketError.TimedOut)
+                    throw;
+
+                return false;
+            }
+
+            if (_bytesReceived != _bytesToReceive)
+                return false;
+
+            result = new byte[_bytesToReceive - PacketHeaderSize];
+            Array.Copy(ReceiveBuffer, 2, result, 0, result.Length);
+            _bytesReceived = 0;
+            _bytesToReceive = 0;
+            return true;
         }
 
         public void Dispose()
@@ -343,36 +326,202 @@ class Program
             }
         }
     }
+}
+```
 
-    public class HttpResponse
+## Клиент
+
+```csharp
+using System.Collections.Concurrent;
+using System.Diagnostics.CodeAnalysis;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+
+namespace Server;
+
+class Program
+{
+    static async Task Main(string[] args)
     {
-        public string Content { get; }
-        public Type Status { get; }
+        var listenPort = 22102;
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        socket.ReceiveTimeout = 1;
+        socket.SendTimeout = 1;
+        socket.Connect(IPAddress.Parse("127.0.0.1"), listenPort);
 
-        public HttpResponse(string content, Type status)
-        {
-            Content = content;
-            Status = status;
-        }
+        var connection = new Connection(socket);
+        var messages = new ConcurrentQueue<string>();
+        var thread = new Thread(() => PollMessages(connection, messages));
+        thread.Start();
 
-        public string GetStatusString()
+        var userInputBuffer = new StringBuilder();
+        while (true)
         {
-            return Status switch
+            while (messages.TryDequeue(out var result))
             {
-                Type.Success => "200 OK",
-                Type.BadRequest => "400 Bad Request",
-                Type.NotFound => "404 Not Found",
-                Type.InternalServerError => "500 Internal Server Error",
-                _ => throw new ArgumentOutOfRangeException()
-            };
+                // Всё это нужно чтобы инпут юзера всегда оставался снизу
+                var currentCursorPosition = Console.GetCursorPosition();
+                Console.SetCursorPosition(0, currentCursorPosition.Top);
+                Console.Write(new string(' ', Console.BufferWidth));
+                Console.SetCursorPosition(0, currentCursorPosition.Top);
+
+                Console.WriteLine(result);
+
+                if (userInputBuffer.Length > 0)
+                    Console.Write(userInputBuffer.ToString());
+            }
+
+            if (!Console.KeyAvailable)
+                continue;
+
+            var key = Console.ReadKey(true);
+            if (key.Key == ConsoleKey.Enter)
+            {
+                var userInput = userInputBuffer.ToString();
+                var dataRaw = Encoding.UTF32.GetBytes(userInput);
+                connection.Send(dataRaw);
+
+                userInputBuffer.Clear();
+                Console.WriteLine();
+            }
+            else
+            {
+                userInputBuffer.Append(key.KeyChar);
+                Console.Write(key.KeyChar);
+            }
+        }
+    }
+
+    private static void PollMessages(Connection connection, ConcurrentQueue<string> messages)
+    {
+        while (true)
+        {
+            while (connection.PollRead(out var data))
+            {
+                var message = UTF32Encoding.UTF32.GetString(data);
+                messages.Enqueue(message);
+            }
+
+            while (connection.PollWrite())
+                Thread.Sleep(1);
+        }
+    }
+
+    private class Connection : IDisposable
+    {
+        private const int PacketHeaderSize = 2;
+
+        public readonly Socket Client;
+        public readonly byte[] ReceiveBuffer = new byte[1024 * 8];
+        public readonly byte[] SendBuffer = new byte[1024 * 8];
+
+        private int _sentBytes;
+        private int _bytesToSent;
+        private int _bytesReceived;
+        private int _bytesToReceive;
+
+        public Connection(Socket client)
+        {
+            Client = client;
         }
 
-        public enum Type
+        public void Send(Span<byte> data)
         {
-            Success,
-            BadRequest,
-            NotFound,
-            InternalServerError
+            while (PollWrite())
+                Thread.Sleep(1);
+
+            var size = (ushort)data.Length;
+            SendBuffer[0] = (byte)(size & 0xFF);
+            SendBuffer[1] = (byte)((size >> 8) & 0xFF);
+
+            var sizeWithHeader = data.Length + PacketHeaderSize;
+            if (sizeWithHeader > SendBuffer.Length)
+                throw new InvalidOperationException("Data is too big");
+
+            data.CopyTo(SendBuffer.AsSpan(PacketHeaderSize));
+            _bytesToSent = sizeWithHeader;
+            _sentBytes = 0;
+        }
+
+        public bool PollWrite()
+        {
+            if (_sentBytes >= _bytesToSent)
+                return false;
+
+            try
+            {
+                var sentBytes = Client.Send(SendBuffer, _sentBytes, _bytesToSent - _sentBytes, SocketFlags.None);
+                _sentBytes += sentBytes;
+                return true;
+            }
+            catch (SocketException e)
+            {
+                if (e.SocketErrorCode != SocketError.TimedOut)
+                    throw;
+
+                return false;
+            }
+        }
+
+        public bool PollRead([MaybeNullWhen(false)] out byte[] result)
+        {
+            result = null;
+
+            if (_bytesReceived < PacketHeaderSize)
+            {
+                try
+                {
+                    _bytesReceived += Client.Receive(ReceiveBuffer, 0, PacketHeaderSize - _bytesReceived,
+                        SocketFlags.None);
+                }
+                catch (SocketException e)
+                {
+                    if (e.SocketErrorCode != SocketError.TimedOut)
+                        throw;
+
+                    return false;
+                }
+
+                if (_bytesReceived < PacketHeaderSize)
+                    return false;
+
+                var packetSize = ReceiveBuffer[0] | (ReceiveBuffer[1] << 8);
+                _bytesToReceive = packetSize + PacketHeaderSize;
+            }
+
+            try
+            {
+                _bytesReceived += Client.Receive(ReceiveBuffer, _bytesReceived, _bytesToReceive - _bytesReceived,
+                    SocketFlags.None);
+            }
+            catch (SocketException e)
+            {
+                if (e.SocketErrorCode != SocketError.TimedOut)
+                    throw;
+
+                return false;
+            }
+
+            if (_bytesReceived != _bytesToReceive)
+                return false;
+
+            result = new byte[_bytesToReceive - PacketHeaderSize];
+            Array.Copy(ReceiveBuffer, 2, result, 0, result.Length);
+            _bytesReceived = 0;
+            _bytesToReceive = 0;
+            return true;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Client.Dispose();
+            }
+            catch (SocketException)
+            {
+            }
         }
     }
 }

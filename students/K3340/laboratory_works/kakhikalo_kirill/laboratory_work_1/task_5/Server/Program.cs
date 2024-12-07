@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -39,7 +40,7 @@ class Program
             var htmlTemplatePage = File.ReadAllText("index.html");
             htmlTemplatePage = htmlTemplatePage.Replace("$$$$$$",
                 marks.Select(e => $"<li>Discipline {e.Discipline}: {e.MarkValue}</li>").Aggregate((a, b) => a + b));
-            
+
             return new HttpResponse(htmlTemplatePage, HttpResponse.Type.Success);
         });
 
@@ -60,7 +61,7 @@ class Program
     private class WebServer
     {
         private readonly Socket _socket;
-        private readonly Dictionary<EndPoint, Connection> _connections = new();
+        private readonly ConcurrentDictionary<EndPoint, Connection> _connections = new();
 
         private readonly Dictionary<string, Func<Dictionary<string, string>, Task<HttpResponse>>>
             _routeHandlersGet = new();
@@ -95,8 +96,16 @@ class Program
                 var receivingTask = connection.Value.ReceivingTask;
                 if (receivingTask is null)
                 {
-                    receivingTask = connection.Value.Client.ReceiveAsync(connection.Value.Buffer);
-                    connection.Value.ReceivingTask = receivingTask;
+                    try
+                    {
+                        receivingTask = connection.Value.Client.ReceiveAsync(connection.Value.Buffer);
+                        connection.Value.ReceivingTask = receivingTask;
+                    }
+                    catch (SocketException e)
+                    {
+                        _connections.TryRemove(connection.Key, out _);
+                    }
+
                     continue;
                 }
 
@@ -122,13 +131,13 @@ class Program
                     if (e.SocketErrorCode != SocketError.ConnectionReset)
                         Console.WriteLine(e);
                     connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
+                    _connections.TryRemove(connection.Key, out _);
                 }
                 catch (Exception e)
                 {
                     Console.WriteLine(e);
                     connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
+                    _connections.TryRemove(connection.Key, out _);
                 }
             }
         }
@@ -159,7 +168,7 @@ class Program
                 {
                     Console.WriteLine(e);
                     connection.Value.Dispose();
-                    _connections.Remove(connection.Key);
+                    _connections.TryRemove(connection.Key, out _);
                 }
             }
         }
@@ -189,7 +198,7 @@ class Program
             }
 
             var connection = new Connection(e.AcceptSocket);
-            _connections.Add(connection.Client.RemoteEndPoint, connection);
+            _connections.TryAdd(connection.Client.RemoteEndPoint, connection);
             _isWaitingForConnection = false;
         }
 
